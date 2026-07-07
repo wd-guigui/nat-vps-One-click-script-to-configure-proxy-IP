@@ -1,8 +1,15 @@
 #!/usr/bin/env sh
+
 set -eu
 
 WORK_DIR="/etc/sing-box-nat"
 CONFIG_ENV="$WORK_DIR/config.env"
+CONFIG_JSON="$WORK_DIR/config.json"
+SB_BIN="$WORK_DIR/sing-box"
+CF_BIN="$WORK_DIR/cloudflared"
+SB_TGZ="$WORK_DIR/sing-box.tgz"
+CF_TMP="$WORK_DIR/cloudflared.tmp"
+EXTRACT_DIR="$WORK_DIR/extract"
 LOCAL_PORT_DEFAULT="8001"
 CLIENT_PORT="443"
 WS_PATH="/vmess-argo"
@@ -15,153 +22,8 @@ plain(){ printf '%s\n' "$1" >&2; }
 restore_tty() {
   stty echo >/dev/null 2>&1 || true
 }
+
 trap restore_tty EXIT INT TERM
-
-ask_required() {
-  prompt="$1"
-
-  while :; do
-    printf "%s: " "$prompt" >&2
-    read -r value
-
-    if [ -n "$value" ]; then
-      printf '%s' "$value"
-      return 0
-    fi
-
-    red "这一项不能为空，请重新填写。"
-  done
-}
-
-ask_optional() {
-  prompt="$1"
-
-  printf "%s: " "$prompt" >&2
-  read -r value
-  printf '%s' "$value"
-}
-
-ask_secret_required() {
-  prompt="$1"
-
-  while :; do
-    printf "%s: " "$prompt" >&2
-
-    if command -v stty >/dev/null 2>&1; then
-      stty -echo || true
-      read -r value
-      stty echo || true
-      printf '\n' >&2
-    else
-      read -r value
-    fi
-
-    if [ -n "$value" ]; then
-      printf '%s' "$value"
-      return 0
-    fi
-
-    red "这一项不能为空，请重新填写。"
-  done
-}
-
-ask_secret_optional() {
-  prompt="$1"
-
-  printf "%s: " "$prompt" >&2
-
-  if command -v stty >/dev/null 2>&1; then
-    stty -echo || true
-    read -r value
-    stty echo || true
-    printf '\n' >&2
-  else
-    read -r value
-  fi
-
-  printf '%s' "$value"
-}
-
-ask_proxy_type() {
-  while :; do
-    echo >&2
-    yellow "请选择代理类型："
-    plain "  1) SOCKS5"
-    plain "  2) HTTP"
-    printf "请输入 1 或 2: " >&2
-    read -r choice
-
-    case "$choice" in
-      1)
-        printf 'socks'
-        return 0
-        ;;
-      2)
-        printf 'http'
-        return 0
-        ;;
-      *)
-        red "只能输入 1 或 2。"
-        ;;
-    esac
-  done
-}
-
-ask_local_port() {
-  while :; do
-    printf "填写本机监听端口；Cloudflare Tunnel 公共主机名的服务地址端口必须和这里一致，直接回车使用 8001: " >&2
-    read -r value
-
-    if [ -z "$value" ]; then
-      value="$LOCAL_PORT_DEFAULT"
-    fi
-
-    case "$value" in
-      ''|*[!0-9]*)
-        red "端口必须是数字。"
-        ;;
-      *)
-        if [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
-          printf '%s' "$value"
-          return 0
-        else
-          red "端口必须在 1 到 65535 之间。"
-        fi
-        ;;
-    esac
-  done
-}
-
-validate_port() {
-  name="$1"
-  port="$2"
-
-  case "$port" in
-    ''|*[!0-9]*)
-      red "$name 必须是数字端口。"
-      exit 1
-      ;;
-  esac
-
-  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    red "$name 必须在 1 到 65535 之间。"
-    exit 1
-  fi
-}
-
-json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-env_escape() {
-  printf '%s' "$1" | sed "s/'/'\\\\''/g"
-}
-
-write_env_line() {
-  key="$1"
-  value="$2"
-  printf "%s='%s'\n" "$key" "$(env_escape "$value")"
-}
 
 need_root() {
   if [ "$(id -u)" != "0" ]; then
@@ -170,45 +32,120 @@ need_root() {
   fi
 }
 
-install_pkgs() {
-  yellow "安装依赖..."
+ask_default() {
+  prompt="$1"
+  default="$2"
 
-  if command -v apk >/dev/null 2>&1; then
-    apk update
-    apk add --no-cache curl tar gzip ca-certificates coreutils openrc sed grep findutils
-    update-ca-certificates || true
-  elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar gzip ca-certificates coreutils sed grep findutils
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl tar gzip ca-certificates coreutils sed grep findutils
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl tar gzip ca-certificates coreutils sed grep findutils
+  if [ -n "$default" ]; then
+    printf "%s [%s]: " "$prompt" "$default" >&2
   else
-    red "无法识别系统包管理器。"
-    exit 1
+    printf "%s: " "$prompt" >&2
+  fi
+
+  read -r value || value=""
+
+  if [ -n "$value" ]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
   fi
 }
 
-detect_service_manager() {
-  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    SERVICE_MANAGER="systemd"
-  elif command -v rc-service >/dev/null 2>&1 || [ -d /etc/init.d ]; then
-    SERVICE_MANAGER="openrc"
+ask_required() {
+  prompt="$1"
+  default="${2:-}"
+
+  while :; do
+    value="$(ask_default "$prompt" "$default")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    red "这一项不能为空，请重新填写。"
+  done
+}
+
+ask_secret() {
+  prompt="$1"
+  default="${2:-}"
+
+  if [ -n "$default" ]; then
+    printf "%s（已保存，直接回车沿用）: " "$prompt" >&2
   else
-    SERVICE_MANAGER="unknown"
+    printf "%s: " "$prompt" >&2
   fi
 
-  yellow "检测到服务管理器：$SERVICE_MANAGER"
+  stty -echo >/dev/null 2>&1 || true
+  read -r value || value=""
+  stty echo >/dev/null 2>&1 || true
+  printf '\n' >&2
 
-  if [ "$SERVICE_MANAGER" = "unknown" ]; then
-    red "未检测到 systemd 或 OpenRC，当前系统暂不适配。"
+  if [ -n "$value" ]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+is_port() {
+  p="$1"
+  case "$p" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+json_escape() {
+  printf '%s' "$1" | awk '
+  BEGIN { first = 1 }
+  {
+    gsub(/\\/,"\\\\")
+    gsub(/"/,"\\\"")
+    gsub(/\t/,"\\t")
+    gsub(/\r/,"\\r")
+    if (!first) {
+      printf "\\n"
+    }
+    printf "%s", $0
+    first = 0
+  }'
+}
+
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+base64_one_line() {
+  base64 | tr -d '\n'
+}
+
+detect_os() {
+  IS_ALPINE="false"
+
+  if [ -f /etc/alpine-release ]; then
+    IS_ALPINE="true"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    SERVICE_MANAGER="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    SERVICE_MANAGER="openrc"
+  else
+    SERVICE_MANAGER="none"
+  fi
+
+  if [ "$SERVICE_MANAGER" = "none" ]; then
+    red "未检测到 systemd 或 openrc，无法自动创建服务。"
     exit 1
   fi
 }
 
 detect_arch() {
-  case "$(uname -m)" in
+  raw_arch="$(uname -m)"
+
+  case "$raw_arch" in
     x86_64|amd64)
       SB_ARCH="amd64"
       CF_ARCH="amd64"
@@ -217,219 +154,260 @@ detect_arch() {
       SB_ARCH="arm64"
       CF_ARCH="arm64"
       ;;
+    armv7l|armv7)
+      SB_ARCH="armv7"
+      CF_ARCH="arm"
+      ;;
     i386|i686)
       SB_ARCH="386"
       CF_ARCH="386"
       ;;
-    armv7l)
-      SB_ARCH="armv7"
-      CF_ARCH="arm"
-      ;;
     *)
-      red "不支持的 CPU 架构：$(uname -m)"
+      red "暂不支持当前 CPU 架构：$raw_arch"
       exit 1
       ;;
   esac
+}
 
-  yellow "检测到 CPU 架构：$(uname -m)"
+install_deps() {
+  plain "安装基础依赖..."
+
+  if command -v apk >/dev/null 2>&1; then
+    apk update
+    apk add --no-cache curl tar ca-certificates openssl awk sed grep coreutils >/dev/null
+    update-ca-certificates >/dev/null 2>&1 || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar ca-certificates openssl gawk sed grep coreutils >/dev/null
+    update-ca-certificates >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl tar ca-certificates openssl gawk sed grep coreutils >/dev/null
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl tar ca-certificates openssl gawk sed grep coreutils >/dev/null
+  else
+    red "未检测到支持的包管理器：apk / apt-get / dnf / yum"
+    exit 1
+  fi
+}
+
+load_old_config() {
+  if [ -f "$CONFIG_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_ENV" || true
+  fi
+
+  NODE_NAME="${NODE_NAME:-JP-NAT1-Chain}"
+  PROXY_TYPE="${PROXY_TYPE:-socks}"
+  PROXY_SERVER="${PROXY_SERVER:-isp.decodo.com}"
+  PROXY_PORT="${PROXY_PORT:-10002}"
+  PROXY_USER="${PROXY_USER:-}"
+  PROXY_PASS="${PROXY_PASS:-}"
+  ARGO_DOMAIN="${ARGO_DOMAIN:-jp-nat1.example.com}"
+  ARGO_TOKEN="${ARGO_TOKEN:-}"
+  CLIENT_ADDR="${CLIENT_ADDR:-$ARGO_DOMAIN}"
+  LOCAL_PORT="${LOCAL_PORT:-$LOCAL_PORT_DEFAULT}"
+  UUID="${UUID:-}"
 }
 
 gen_uuid() {
-  if [ -r /proc/sys/kernel/random/uuid ]; then
+  if [ -f /proc/sys/kernel/random/uuid ]; then
     cat /proc/sys/kernel/random/uuid
   elif command -v uuidgen >/dev/null 2>&1; then
     uuidgen
   else
-    od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\)$/\1-\2-\3-\4-\5/'
+    openssl rand -hex 16 | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\)$/\1-\2-\3-\4-\5/'
   fi
 }
 
 collect_config() {
-  echo >&2
-  yellow "开始填写安装参数。"
-  yellow "真实代理账号、代理密码、Cloudflare Tunnel token 只会保存到当前小鸡本地，不会写进 GitHub。"
-  echo >&2
+  plain "开始填写安装参数。直接回车可使用方括号内的默认值。"
+  plain ""
 
-  NODE_NAME="$(ask_required '填写节点名称')"
-  PROXY_TYPE="$(ask_proxy_type)"
+  NODE_NAME="$(ask_required "请输入节点名称，例如 JP-NAT1-Chain" "$NODE_NAME")"
+  PROXY_TYPE="$(ask_required "请输入代理类型，只能填 socks 或 http" "$PROXY_TYPE")"
 
-  echo >&2
-  PROXY_SERVER="$(ask_required '填写代理服务器域名或 IP 地址')"
-
-  echo >&2
-  PROXY_PORT="$(ask_required '填写代理端口')"
-
-  echo >&2
-  PROXY_USER="$(ask_optional '填写代理账号；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写账号')"
-
-  echo >&2
-  PROXY_PASS="$(ask_secret_optional '填写代理密码；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写密码')"
-
-  echo >&2
-  ARGO_DOMAIN="$(ask_required '填写 Cloudflare Tunnel 固定域名')"
-
-  echo >&2
-  ARGO_AUTH="$(ask_secret_required '填写 Cloudflare Tunnel token，通常是 eyJ 开头的一整串')"
-
-  echo >&2
-  yellow "客户端连接端口固定使用 443，无需填写。"
-
-  echo >&2
-  LOCAL_PORT="$(ask_local_port)"
-
-  validate_port "代理端口" "$PROXY_PORT"
-  validate_port "本机监听端口" "$LOCAL_PORT"
-
-  if [ -n "$PROXY_PASS" ] && [ -z "$PROXY_USER" ]; then
-    red "你填写了代理密码，但代理账号为空。请重新运行脚本，并同时填写代理账号和密码。"
-    exit 1
-  fi
-
-  case "$ARGO_AUTH" in
-    eyJ*)
-      ;;
+  case "$PROXY_TYPE" in
+    socks|http) ;;
     *)
-      yellow "提醒：你填写的 Cloudflare Tunnel token 不是 eyJ 开头，请确认是否复制完整。"
+      red "代理类型只支持 socks 或 http。"
+      exit 1
       ;;
   esac
 
-  UUID="$(gen_uuid)"
+  PROXY_SERVER="$(ask_required "请输入代理服务器，例如 isp.decodo.com" "$PROXY_SERVER")"
+  PROXY_PORT="$(ask_required "请输入代理端口，例如 10002" "$PROXY_PORT")"
+
+  if ! is_port "$PROXY_PORT"; then
+    red "代理端口不合法：$PROXY_PORT"
+    exit 1
+  fi
+
+  PROXY_USER="$(ask_default "请输入代理账号，没有就留空" "$PROXY_USER")"
+  PROXY_PASS="$(ask_secret "请输入代理密码，没有就直接回车" "$PROXY_PASS")"
+
+  ARGO_DOMAIN="$(ask_required "请输入 Cloudflare Tunnel 固定域名，例如 jp-nat1.chende97.com" "$ARGO_DOMAIN")"
+  ARGO_TOKEN="$(ask_secret "请输入 Cloudflare Tunnel token，也就是 eyJ 开头那一整串" "$ARGO_TOKEN")"
+
+  if [ -z "$ARGO_TOKEN" ]; then
+    red "Cloudflare Tunnel token 不能为空。"
+    exit 1
+  fi
+
+  CLIENT_ADDR="$(ask_required "请输入客户端连接地址，通常和固定域名一致" "$ARGO_DOMAIN")"
+
+  plain "客户端连接端口固定使用 443，无需填写。"
+
+  LOCAL_PORT="$(ask_required "填写本机监听端口；Cloudflare Tunnel 公共主机名的服务地址端口必须和这里一致" "$LOCAL_PORT")"
+
+  if ! is_port "$LOCAL_PORT"; then
+    red "本机监听端口不合法：$LOCAL_PORT"
+    exit 1
+  fi
+
+  if [ -z "$UUID" ]; then
+    UUID="$(gen_uuid)"
+  fi
 }
 
-prepare_dirs() {
+save_config() {
   mkdir -p "$WORK_DIR"
-  chmod 700 "$WORK_DIR"
-}
 
-save_config_env() {
   {
-    write_env_line NODE_NAME "$NODE_NAME"
-    write_env_line PROXY_TYPE "$PROXY_TYPE"
-    write_env_line PROXY_SERVER "$PROXY_SERVER"
-    write_env_line PROXY_PORT "$PROXY_PORT"
-    write_env_line PROXY_USER "$PROXY_USER"
-    write_env_line PROXY_PASS "$PROXY_PASS"
-    write_env_line ARGO_DOMAIN "$ARGO_DOMAIN"
-    write_env_line ARGO_AUTH "$ARGO_AUTH"
-    write_env_line CLIENT_PORT "$CLIENT_PORT"
-    write_env_line LOCAL_PORT "$LOCAL_PORT"
-    write_env_line UUID "$UUID"
-    write_env_line WS_PATH "$WS_PATH"
+    printf 'NODE_NAME='; shell_quote "$NODE_NAME"; printf '\n'
+    printf 'PROXY_TYPE='; shell_quote "$PROXY_TYPE"; printf '\n'
+    printf 'PROXY_SERVER='; shell_quote "$PROXY_SERVER"; printf '\n'
+    printf 'PROXY_PORT='; shell_quote "$PROXY_PORT"; printf '\n'
+    printf 'PROXY_USER='; shell_quote "$PROXY_USER"; printf '\n'
+    printf 'PROXY_PASS='; shell_quote "$PROXY_PASS"; printf '\n'
+    printf 'ARGO_DOMAIN='; shell_quote "$ARGO_DOMAIN"; printf '\n'
+    printf 'ARGO_TOKEN='; shell_quote "$ARGO_TOKEN"; printf '\n'
+    printf 'CLIENT_ADDR='; shell_quote "$CLIENT_ADDR"; printf '\n'
+    printf 'CLIENT_PORT='; shell_quote "$CLIENT_PORT"; printf '\n'
+    printf 'LOCAL_PORT='; shell_quote "$LOCAL_PORT"; printf '\n'
+    printf 'WS_PATH='; shell_quote "$WS_PATH"; printf '\n'
+    printf 'UUID='; shell_quote "$UUID"; printf '\n'
   } > "$CONFIG_ENV"
 
   chmod 600 "$CONFIG_ENV"
 }
 
 stop_old_services() {
-  yellow "停止旧服务..."
+  plain "停止旧服务..."
 
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    systemctl stop sing-box-nat >/dev/null 2>&1 || true
-    systemctl stop argo-nat >/dev/null 2>&1 || true
+    systemctl stop sing-box-nat.service >/dev/null 2>&1 || true
+    systemctl stop argo-nat.service >/dev/null 2>&1 || true
   elif [ "$SERVICE_MANAGER" = "openrc" ]; then
-    mkdir -p /run/openrc
-    touch /run/openrc/softlevel || true
     rc-service sing-box-nat stop >/dev/null 2>&1 || true
     rc-service argo-nat stop >/dev/null 2>&1 || true
   fi
 }
 
-download_core() {
-  yellow "下载 sing-box 和 cloudflared..."
+get_latest_singbox_version() {
+  release_json="$WORK_DIR/sing-box-release.json"
 
-  API_FILE="$WORK_DIR/sing-box-release.json"
-  SB_TGZ="$WORK_DIR/sing-box.tgz"
-  EXTRACT_DIR="$WORK_DIR/sing-box-extract"
-  CF_TMP="$WORK_DIR/cloudflared.download"
+  curl -fsSL -o "$release_json" "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
-  rm -f "$API_FILE" "$SB_TGZ" "$CF_TMP"
-  rm -rf "$EXTRACT_DIR"
+  tag="$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$release_json" | head -n 1)"
 
-  curl -fL --retry 3 --connect-timeout 20 -o "$API_FILE" \
-    "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-
-  SB_TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$API_FILE" | sed -n '1p')"
-  SB_VER="${SB_TAG#v}"
-
-  if [ -z "$SB_VER" ]; then
-    red "获取 sing-box 最新版本失败。"
+  if [ -z "$tag" ]; then
+    red "无法获取 sing-box 最新版本号。"
     exit 1
   fi
 
-  yellow "检测到 sing-box 最新版本：v$SB_VER"
+  SB_TAG="$tag"
+  SB_VER="${SB_TAG#v}"
+}
 
-  curl -fL --retry 3 --connect-timeout 20 -o "$SB_TGZ" \
-    "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+download_binaries() {
+  plain "下载 sing-box 和 cloudflared..."
+
+  mkdir -p "$WORK_DIR"
+  rm -rf "$EXTRACT_DIR"
+  rm -f "$SB_TGZ" "$CF_TMP"
+
+  get_latest_singbox_version
+
+  green "检测到 sing-box 最新版本：$SB_TAG"
+
+  if [ "$IS_ALPINE" = "true" ]; then
+    SB_PACKAGE="sing-box-${SB_VER}-linux-${SB_ARCH}-musl.tar.gz"
+    green "检测到 Alpine，使用 musl 版本：$SB_PACKAGE"
+  else
+    SB_PACKAGE="sing-box-${SB_VER}-linux-${SB_ARCH}.tar.gz"
+    green "检测到非 Alpine，使用普通 Linux 版本：$SB_PACKAGE"
+  fi
+
+  SB_URL="https://github.com/SagerNet/sing-box/releases/download/${SB_TAG}/${SB_PACKAGE}"
+  CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+
+  curl -fL --retry 3 --connect-timeout 15 -o "$SB_TGZ" "$SB_URL"
 
   if [ ! -s "$SB_TGZ" ]; then
-    red "sing-box 下载失败，文件为空或不存在。"
+    red "sing-box 下载失败：$SB_URL"
     exit 1
   fi
 
   mkdir -p "$EXTRACT_DIR"
   tar -xzf "$SB_TGZ" -C "$EXTRACT_DIR"
 
-  SB_BIN="$(find "$EXTRACT_DIR" -type f -name sing-box | sed -n '1p')"
+  found_bin="$(find "$EXTRACT_DIR" -type f -name sing-box | head -n 1 || true)"
 
-  if [ -z "$SB_BIN" ]; then
-    red "sing-box 解压失败，没有找到 sing-box 主程序。"
+  if [ -z "$found_bin" ]; then
+    red "sing-box 解压后未找到可执行文件。"
     exit 1
   fi
 
-  install -m 755 "$SB_BIN" "$WORK_DIR/sing-box"
+  install -m 755 "$found_bin" "$SB_BIN"
 
-  curl -fL --retry 3 --connect-timeout 20 -o "$CF_TMP" \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+  curl -fL --retry 3 --connect-timeout 15 -o "$CF_TMP" "$CF_URL"
 
   if [ ! -s "$CF_TMP" ]; then
-    red "cloudflared 下载失败，文件为空或不存在。"
+    red "cloudflared 下载失败：$CF_URL"
     exit 1
   fi
 
-  chmod +x "$CF_TMP"
-  mv -f "$CF_TMP" "$WORK_DIR/cloudflared"
+  install -m 755 "$CF_TMP" "$CF_BIN"
 
-  rm -f "$API_FILE" "$SB_TGZ"
   rm -rf "$EXTRACT_DIR"
+  rm -f "$SB_TGZ" "$CF_TMP" "$WORK_DIR/sing-box-release.json"
 
   green "sing-box 和 cloudflared 下载完成。"
 }
 
-make_singbox_config() {
-  yellow "生成 sing-box 配置..."
+generate_singbox_config() {
+  plain "生成 sing-box 配置..."
 
-  P_SERVER="$(json_escape "$PROXY_SERVER")"
-  P_USER="$(json_escape "$PROXY_USER")"
-  P_PASS="$(json_escape "$PROXY_PASS")"
-
-  AUTH_FIELDS=""
-  if [ -n "$PROXY_USER" ]; then
-    AUTH_FIELDS=",\"username\":\"${P_USER}\",\"password\":\"${P_PASS}\""
-  fi
+  node_name_json="$(json_escape "$NODE_NAME")"
+  proxy_server_json="$(json_escape "$PROXY_SERVER")"
+  proxy_user_json="$(json_escape "$PROXY_USER")"
+  proxy_pass_json="$(json_escape "$PROXY_PASS")"
+  uuid_json="$(json_escape "$UUID")"
 
   if [ "$PROXY_TYPE" = "socks" ]; then
-    OUTBOUND="{\"type\":\"socks\",\"tag\":\"proxy-out\",\"server\":\"${P_SERVER}\",\"server_port\":${PROXY_PORT},\"version\":\"5\"${AUTH_FIELDS},\"network\":\"tcp\"}"
+    outbound_type="socks"
+    extra_line='    "version": "5",'
   else
-    OUTBOUND="{\"type\":\"http\",\"tag\":\"proxy-out\",\"server\":\"${P_SERVER}\",\"server_port\":${PROXY_PORT}${AUTH_FIELDS}}"
+    outbound_type="http"
+    extra_line=""
   fi
 
-  cat > "$WORK_DIR/config.json" <<EOF
+  cat > "$CONFIG_JSON" <<EOF
 {
   "log": {
-    "disabled": false,
     "level": "info",
-    "output": "$WORK_DIR/sing-box.log",
     "timestamp": true
   },
   "inbounds": [
     {
       "type": "vmess",
-      "tag": "vmess-ws-argo-in",
+      "tag": "vmess-in",
       "listen": "127.0.0.1",
       "listen_port": $LOCAL_PORT,
       "users": [
         {
-          "uuid": "$UUID",
+          "name": "$node_name_json",
+          "uuid": "$uuid_json",
           "alterId": 0
         }
       ],
@@ -440,14 +418,18 @@ make_singbox_config() {
     }
   ],
   "outbounds": [
-    $OUTBOUND,
+    {
+      "type": "$outbound_type",
+      "tag": "proxy-out",
+      "server": "$proxy_server_json",
+      "server_port": $PROXY_PORT,
+$extra_line
+      "username": "$proxy_user_json",
+      "password": "$proxy_pass_json"
+    },
     {
       "type": "direct",
       "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
     }
   ],
   "route": {
@@ -456,24 +438,36 @@ make_singbox_config() {
 }
 EOF
 
-  "$WORK_DIR/sing-box" check -c "$WORK_DIR/config.json"
+  chmod 600 "$CONFIG_JSON"
 }
 
-make_systemd_services() {
-  yellow "创建 systemd 服务..."
+check_singbox_config() {
+  plain "检查 sing-box 配置..."
 
+  if ! "$SB_BIN" version >/dev/null 2>&1; then
+    red "sing-box 无法运行。"
+    red "如果系统是 Alpine，说明 musl 版本仍不兼容当前小鸡。"
+    exit 1
+  fi
+
+  "$SB_BIN" check -c "$CONFIG_JSON"
+
+  green "sing-box 配置检查通过。"
+}
+
+write_systemd_services() {
   cat > /etc/systemd/system/sing-box-nat.service <<EOF
 [Unit]
-Description=sing-box NAT proxy chain
-After=network.target nss-lookup.target
+Description=sing-box NAT chain proxy
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=root
-WorkingDirectory=$WORK_DIR
-ExecStart=$WORK_DIR/sing-box run -c $WORK_DIR/config.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=infinity
+Type=simple
+ExecStart=$SB_BIN run -c $CONFIG_JSON
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -481,181 +475,221 @@ EOF
 
   cat > /etc/systemd/system/argo-nat.service <<EOF
 [Unit]
-Description=Cloudflare Tunnel for sing-box NAT proxy chain
-After=network.target sing-box-nat.service
+Description=Cloudflare Tunnel for NAT chain proxy
+After=network-online.target sing-box-nat.service
+Wants=network-online.target
+Requires=sing-box-nat.service
 
 [Service]
-User=root
-WorkingDirectory=$WORK_DIR
-ExecStart=$WORK_DIR/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $ARGO_AUTH
-Restart=on-failure
-RestartSec=5
+Type=simple
+EnvironmentFile=$CONFIG_ENV
+ExecStart=$CF_BIN --no-autoupdate tunnel run --token \${ARGO_TOKEN}
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+  chmod 600 /etc/systemd/system/sing-box-nat.service
+  chmod 600 /etc/systemd/system/argo-nat.service
+
   systemctl daemon-reload
-  systemctl enable sing-box-nat argo-nat >/dev/null
-  systemctl restart sing-box-nat
-  sleep 2
-  systemctl restart argo-nat
+  systemctl enable --now sing-box-nat.service
+  systemctl enable --now argo-nat.service
 }
 
-make_openrc_services() {
-  yellow "创建 OpenRC 服务..."
-
-  mkdir -p /run/openrc
-  touch /run/openrc/softlevel || true
-
+write_openrc_services() {
   cat > /etc/init.d/sing-box-nat <<EOF
 #!/sbin/openrc-run
 
 name="sing-box-nat"
-description="sing-box NAT proxy chain"
+description="sing-box NAT chain proxy"
 
-command="$WORK_DIR/sing-box"
-command_args="run -c $WORK_DIR/config.json"
+command="$SB_BIN"
+command_args="run -c $CONFIG_JSON"
 command_background="yes"
 pidfile="/run/sing-box-nat.pid"
-directory="$WORK_DIR"
-
-output_log="$WORK_DIR/sing-box.stdout.log"
-error_log="$WORK_DIR/sing-box.stderr.log"
 
 depend() {
-  after net
+  need net
 }
 EOF
-
-  chmod +x /etc/init.d/sing-box-nat
 
   cat > /etc/init.d/argo-nat <<EOF
 #!/sbin/openrc-run
 
 name="argo-nat"
-description="Cloudflare Tunnel for sing-box NAT proxy chain"
+description="Cloudflare Tunnel for NAT chain proxy"
 
-command="$WORK_DIR/cloudflared"
-command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $ARGO_AUTH"
+CONFIG_ENV="$CONFIG_ENV"
+
+if [ -f "\$CONFIG_ENV" ]; then
+  . "\$CONFIG_ENV"
+fi
+
+command="$CF_BIN"
+command_args="--no-autoupdate tunnel run --token \${ARGO_TOKEN}"
 command_background="yes"
 pidfile="/run/argo-nat.pid"
-directory="$WORK_DIR"
-
-output_log="$WORK_DIR/argo.stdout.log"
-error_log="$WORK_DIR/argo.stderr.log"
 
 depend() {
-  after net
+  need net
   after sing-box-nat
 }
 EOF
 
-  chmod +x /etc/init.d/argo-nat
+  chmod 755 /etc/init.d/sing-box-nat
+  chmod 700 /etc/init.d/argo-nat
 
   rc-update add sing-box-nat default >/dev/null 2>&1 || true
   rc-update add argo-nat default >/dev/null 2>&1 || true
 
   rc-service sing-box-nat restart
-  sleep 2
+  sleep 1
   rc-service argo-nat restart
 }
 
-make_natlink() {
-  yellow "创建 natlink 查看节点链接命令..."
+write_services() {
+  plain "生成并启动系统服务..."
 
+  if [ "$SERVICE_MANAGER" = "systemd" ]; then
+    write_systemd_services
+  elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+    write_openrc_services
+  else
+    red "不支持的服务管理器：$SERVICE_MANAGER"
+    exit 1
+  fi
+
+  green "服务已启动。"
+}
+
+write_natlink() {
   cat > /usr/local/bin/natlink <<'EOF'
 #!/usr/bin/env sh
-set -eu
 
-. /etc/sing-box-nat/config.env
+CONFIG_ENV="/etc/sing-box-nat/config.env"
 
-JSON="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":"chrome","allowInsecure":"false"}' "$NODE_NAME" "$ARGO_DOMAIN" "$UUID" "$ARGO_DOMAIN" "$WS_PATH" "$ARGO_DOMAIN")"
+if [ ! -f "$CONFIG_ENV" ]; then
+  echo "未找到配置文件：$CONFIG_ENV" >&2
+  exit 1
+fi
 
-LINK="vmess://$(printf "%s" "$JSON" | base64 | tr -d '\n')"
+. "$CONFIG_ENV"
 
-echo "$LINK" | tee /etc/sing-box-nat/vmess.txt
+json_escape() {
+  printf '%s' "$1" | awk '
+  BEGIN { first = 1 }
+  {
+    gsub(/\\/,"\\\\")
+    gsub(/"/,"\\\"")
+    gsub(/\t/,"\\t")
+    gsub(/\r/,"\\r")
+    if (!first) {
+      printf "\\n"
+    }
+    printf "%s", $0
+    first = 0
+  }'
+}
+
+base64_one_line() {
+  base64 | tr -d '\n'
+}
+
+NODE_NAME_JSON="$(json_escape "$NODE_NAME")"
+CLIENT_ADDR_JSON="$(json_escape "$CLIENT_ADDR")"
+UUID_JSON="$(json_escape "$UUID")"
+WS_PATH_JSON="$(json_escape "$WS_PATH")"
+
+VMESS_JSON=$(cat <<JSON
+{
+  "v": "2",
+  "ps": "$NODE_NAME_JSON",
+  "add": "$CLIENT_ADDR_JSON",
+  "port": "$CLIENT_PORT",
+  "id": "$UUID_JSON",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "$CLIENT_ADDR_JSON",
+  "path": "$WS_PATH_JSON",
+  "tls": "tls",
+  "sni": "$CLIENT_ADDR_JSON",
+  "alpn": ""
+}
+JSON
+)
+
+printf 'vmess://%s\n' "$(printf '%s' "$VMESS_JSON" | base64_one_line)"
 EOF
 
-  chmod +x /usr/local/bin/natlink
+  chmod 755 /usr/local/bin/natlink
 }
 
 show_status() {
-  echo >&2
-  yellow "服务状态："
-
-  if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    systemctl --no-pager --full status sing-box-nat | sed -n '1,8p' || true
-    systemctl --no-pager --full status argo-nat | sed -n '1,8p' || true
-  elif [ "$SERVICE_MANAGER" = "openrc" ]; then
-    rc-service sing-box-nat status || true
-    rc-service argo-nat status || true
-  fi
-}
-
-show_result() {
-  echo >&2
+  plain ""
   green "安装完成。"
-  echo >&2
-
-  green "VMess 链接如下："
-  natlink
-
-  echo >&2
-  yellow "Cloudflare Tunnel 公共主机名必须这样配置："
-  plain "  公共主机名：$ARGO_DOMAIN"
-  plain "  服务类型：HTTP"
-  plain "  服务地址：http://127.0.0.1:$LOCAL_PORT"
-  echo >&2
-
-  yellow "客户端连接信息："
-  plain "  地址：$ARGO_DOMAIN"
-  plain "  端口：443"
-  plain "  传输：WebSocket"
-  plain "  路径：$WS_PATH"
-  plain "  TLS：开启"
-  echo >&2
-
-  yellow "常用命令："
+  plain ""
+  plain "节点信息："
+  plain "节点名称：$NODE_NAME"
+  plain "协议：VMess + WebSocket + TLS"
+  plain "客户端地址：$CLIENT_ADDR"
+  plain "客户端端口：443"
+  plain "UUID：$UUID"
+  plain "WebSocket Path：$WS_PATH"
+  plain ""
+  plain "Cloudflare Tunnel 公共主机名必须这样配置："
+  plain "公共主机名：$ARGO_DOMAIN"
+  plain "类型：HTTP"
+  plain "服务地址：http://127.0.0.1:$LOCAL_PORT"
+  plain ""
+  plain "查看 VMess 分享链接："
+  plain "natlink"
+  plain ""
+  plain "查看服务状态："
 
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    plain "  查看 sing-box：systemctl status sing-box-nat --no-pager"
-    plain "  查看 Tunnel：systemctl status argo-nat --no-pager"
-    plain "  重启服务：systemctl restart sing-box-nat argo-nat"
+    plain "systemctl status sing-box-nat --no-pager"
+    plain "systemctl status argo-nat --no-pager"
   else
-    plain "  查看 sing-box：rc-service sing-box-nat status"
-    plain "  查看 Tunnel：rc-service argo-nat status"
-    plain "  重启 sing-box：rc-service sing-box-nat restart"
-    plain "  重启 Tunnel：rc-service argo-nat restart"
+    plain "rc-service sing-box-nat status"
+    plain "rc-service argo-nat status"
   fi
 
-  plain "  查看节点链接：natlink"
-  echo >&2
-
-  yellow "链路结构：客户端 → Cloudflare Tunnel → NAT 小鸡 sing-box → 代理 IP → 目标网站"
+  plain ""
+  green "VMess 分享链接如下："
+  natlink
 }
 
 main() {
   need_root
-  install_pkgs
-  detect_service_manager
+  detect_os
   detect_arch
-  prepare_dirs
-  collect_config
-  save_config_env
-  stop_old_services
-  download_core
-  make_singbox_config
 
-  if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    make_systemd_services
+  mkdir -p "$WORK_DIR"
+
+  plain "检测到服务管理器：$SERVICE_MANAGER"
+  plain "检测到 CPU 架构：$(uname -m)"
+  if [ "$IS_ALPINE" = "true" ]; then
+    plain "检测到系统：Alpine，自动使用 sing-box musl 版本。"
   else
-    make_openrc_services
+    plain "检测到系统：非 Alpine，自动使用 sing-box 普通 Linux 版本。"
   fi
 
-  make_natlink
+  install_deps
+  load_old_config
+  collect_config
+  save_config
+  stop_old_services
+  download_binaries
+  generate_singbox_config
+  check_singbox_config
+  write_services
+  write_natlink
   show_status
-  show_result
 }
 
 main "$@"
