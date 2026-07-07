@@ -1,61 +1,74 @@
 #!/usr/bin/env sh
 set -eu
 
-# NAT VPS sing-box + Cloudflare Tunnel + Proxy IP one-click installer
-# 真实账号、密码、token 只在 SSH 中填写，并保存到小鸡本地。
-# 不要把真实账号、密码、token 写进 GitHub。
-
 WORK_DIR="/etc/sing-box-nat"
 CONFIG_ENV="$WORK_DIR/config.env"
 LOCAL_PORT_DEFAULT="8001"
-CFPORT="443"
+CLIENT_PORT="443"
+WS_PATH="/vmess-argo"
 
 red(){ printf '\033[1;91m%s\033[0m\n' "$1" >&2; }
 green(){ printf '\033[1;32m%s\033[0m\n' "$1" >&2; }
 yellow(){ printf '\033[1;33m%s\033[0m\n' "$1" >&2; }
+plain(){ printf '%s\n' "$1" >&2; }
 
-ask_text() {
-  prompt="$1"
-  default="${2:-}"
-
-  if [ -n "$default" ]; then
-    printf "%s [%s]: " "$prompt" "$default" >&2
-  else
-    printf "%s: " "$prompt" >&2
-  fi
-
-  read -r value
-
-  if [ -z "$value" ] && [ -n "$default" ]; then
-    value="$default"
-  fi
-
-  printf '%s' "$value"
+restore_tty() {
+  stty echo >/dev/null 2>&1 || true
 }
+trap restore_tty EXIT INT TERM
 
 ask_required() {
   prompt="$1"
-  default="${2:-}"
 
   while :; do
-    value="$(ask_text "$prompt" "$default")"
+    printf "%s: " "$prompt" >&2
+    read -r value
+
     if [ -n "$value" ]; then
       printf '%s' "$value"
       return 0
     fi
+
     red "这一项不能为空，请重新填写。"
   done
 }
 
-ask_secret_keep_old() {
+ask_optional() {
   prompt="$1"
-  old_value="${2:-}"
 
-  if [ -n "$old_value" ]; then
-    printf "%s（已保存过，直接回车继续使用旧值）: " "$prompt" >&2
-  else
+  printf "%s: " "$prompt" >&2
+  read -r value
+  printf '%s' "$value"
+}
+
+ask_secret_required() {
+  prompt="$1"
+
+  while :; do
     printf "%s: " "$prompt" >&2
-  fi
+
+    if command -v stty >/dev/null 2>&1; then
+      stty -echo || true
+      read -r value
+      stty echo || true
+      printf '\n' >&2
+    else
+      read -r value
+    fi
+
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+
+    red "这一项不能为空，请重新填写。"
+  done
+}
+
+ask_secret_optional() {
+  prompt="$1"
+
+  printf "%s: " "$prompt" >&2
 
   if command -v stty >/dev/null 2>&1; then
     stty -echo || true
@@ -66,39 +79,17 @@ ask_secret_keep_old() {
     read -r value
   fi
 
-  if [ -z "$value" ] && [ -n "$old_value" ]; then
-    value="$old_value"
-  fi
-
   printf '%s' "$value"
 }
 
 ask_proxy_type() {
-  old_type="${1:-socks}"
-
-  case "$old_type" in
-    socks|socks5)
-      default_choice="1"
-      ;;
-    http|https)
-      default_choice="2"
-      ;;
-    *)
-      default_choice="1"
-      ;;
-  esac
-
   while :; do
     echo >&2
     yellow "请选择代理类型："
-    echo "  1) SOCKS5" >&2
-    echo "  2) HTTP" >&2
-    printf "请输入 1 或 2，直接回车使用当前值 [%s]: " "$default_choice" >&2
+    plain "  1) SOCKS5"
+    plain "  2) HTTP"
+    printf "请输入 1 或 2: " >&2
     read -r choice
-
-    if [ -z "$choice" ]; then
-      choice="$default_choice"
-    fi
 
     case "$choice" in
       1)
@@ -116,6 +107,48 @@ ask_proxy_type() {
   done
 }
 
+ask_local_port() {
+  while :; do
+    printf "填写本机监听端口；Cloudflare Tunnel 公共主机名的服务地址端口必须和这里一致，直接回车使用 8001: " >&2
+    read -r value
+
+    if [ -z "$value" ]; then
+      value="$LOCAL_PORT_DEFAULT"
+    fi
+
+    case "$value" in
+      ''|*[!0-9]*)
+        red "端口必须是数字。"
+        ;;
+      *)
+        if [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
+          printf '%s' "$value"
+          return 0
+        else
+          red "端口必须在 1 到 65535 之间。"
+        fi
+        ;;
+    esac
+  done
+}
+
+validate_port() {
+  name="$1"
+  port="$2"
+
+  case "$port" in
+    ''|*[!0-9]*)
+      red "$name 必须是数字端口。"
+      exit 1
+      ;;
+  esac
+
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    red "$name 必须在 1 到 65535 之间。"
+    exit 1
+  fi
+}
+
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -126,13 +159,13 @@ env_escape() {
 
 write_env_line() {
   key="$1"
-  val="$2"
-  printf "%s='%s'\n" "$key" "$(env_escape "$val")"
+  value="$2"
+  printf "%s='%s'\n" "$key" "$(env_escape "$value")"
 }
 
 need_root() {
   if [ "$(id -u)" != "0" ]; then
-    red "请先切换到 root 用户后再运行。"
+    red "请使用 root 用户运行。"
     exit 1
   fi
 }
@@ -211,89 +244,44 @@ gen_uuid() {
   fi
 }
 
-load_old_config() {
-  OLD_NODE_NAME=""
-  OLD_PROXY_TYPE="socks"
-  OLD_PROXY_SERVER=""
-  OLD_PROXY_PORT=""
-  OLD_PROXY_USER=""
-  OLD_PROXY_PASS=""
-  OLD_ARGO_DOMAIN=""
-  OLD_ARGO_AUTH=""
-  OLD_LOCAL_PORT="$LOCAL_PORT_DEFAULT"
-  OLD_UUID=""
-
-  if [ -f "$CONFIG_ENV" ]; then
-    . "$CONFIG_ENV" || true
-
-    OLD_NODE_NAME="${NODE_NAME:-}"
-    OLD_PROXY_TYPE="${PROXY_TYPE:-socks}"
-    OLD_PROXY_SERVER="${PROXY_SERVER:-}"
-    OLD_PROXY_PORT="${PROXY_PORT:-}"
-    OLD_PROXY_USER="${PROXY_USER:-}"
-    OLD_PROXY_PASS="${PROXY_PASS:-}"
-    OLD_ARGO_DOMAIN="${ARGO_DOMAIN:-}"
-    OLD_ARGO_AUTH="${ARGO_AUTH:-}"
-    OLD_LOCAL_PORT="${LOCAL_PORT:-$LOCAL_PORT_DEFAULT}"
-    OLD_UUID="${UUID:-}"
-  fi
-}
-
-validate_port() {
-  name="$1"
-  port="$2"
-
-  case "$port" in
-    ''|*[!0-9]*)
-      red "$name 必须是数字端口。"
-      exit 1
-      ;;
-  esac
-
-  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    red "$name 必须在 1 到 65535 之间。"
-    exit 1
-  fi
-}
-
 collect_config() {
   echo >&2
   yellow "开始填写安装参数。"
-  yellow "直接回车可以使用方括号内已保存的旧值。"
+  yellow "真实代理账号、代理密码、Cloudflare Tunnel token 只会保存到当前小鸡本地，不会写进 GitHub。"
   echo >&2
 
-  NODE_NAME="$(ask_required '填写节点名称' "$OLD_NODE_NAME")"
-  PROXY_TYPE="$(ask_proxy_type "$OLD_PROXY_TYPE")"
+  NODE_NAME="$(ask_required '填写节点名称')"
+  PROXY_TYPE="$(ask_proxy_type)"
 
   echo >&2
-  PROXY_SERVER="$(ask_required '填写代理服务器域名或 IP 地址' "$OLD_PROXY_SERVER")"
+  PROXY_SERVER="$(ask_required '填写代理服务器域名或 IP 地址')"
 
   echo >&2
-  PROXY_PORT="$(ask_required '填写代理端口' "$OLD_PROXY_PORT")"
+  PROXY_PORT="$(ask_required '填写代理端口')"
 
   echo >&2
-  PROXY_USER="$(ask_text '填写代理账号；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写账号' "$OLD_PROXY_USER")"
+  PROXY_USER="$(ask_optional '填写代理账号；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写账号')"
 
   echo >&2
-  PROXY_PASS="$(ask_secret_keep_old '填写代理密码；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写密码' "$OLD_PROXY_PASS")"
+  PROXY_PASS="$(ask_secret_optional '填写代理密码；如果代理已添加 IP 白名单，直接回车；如有代理账号密码，请填写密码')"
 
   echo >&2
-  ARGO_DOMAIN="$(ask_required '填写 Cloudflare Tunnel 固定域名' "$OLD_ARGO_DOMAIN")"
+  ARGO_DOMAIN="$(ask_required '填写 Cloudflare Tunnel 固定域名')"
 
   echo >&2
-  ARGO_AUTH="$(ask_secret_keep_old '填写 Cloudflare Tunnel token，通常是 eyJ 开头的一整串' "$OLD_ARGO_AUTH")"
+  ARGO_AUTH="$(ask_secret_required '填写 Cloudflare Tunnel token，通常是 eyJ 开头的一整串')"
 
   echo >&2
   yellow "客户端连接端口固定使用 443，无需填写。"
 
   echo >&2
-  LOCAL_PORT="$(ask_required '填写本机监听端口；Cloudflare Tunnel 公共主机名的服务地址端口必须和这里一致' "${OLD_LOCAL_PORT:-$LOCAL_PORT_DEFAULT}")"
+  LOCAL_PORT="$(ask_local_port)"
 
   validate_port "代理端口" "$PROXY_PORT"
   validate_port "本机监听端口" "$LOCAL_PORT"
 
-  if [ -z "$ARGO_AUTH" ]; then
-    red "Cloudflare Tunnel token 不能为空。"
+  if [ -n "$PROXY_PASS" ] && [ -z "$PROXY_USER" ]; then
+    red "你填写了代理密码，但代理账号为空。请重新运行脚本，并同时填写代理账号和密码。"
     exit 1
   fi
 
@@ -305,16 +293,15 @@ collect_config() {
       ;;
   esac
 
-  if [ -n "$OLD_UUID" ]; then
-    UUID="$OLD_UUID"
-  else
-    UUID="$(gen_uuid)"
-  fi
+  UUID="$(gen_uuid)"
+}
+
+prepare_dirs() {
+  mkdir -p "$WORK_DIR"
+  chmod 700 "$WORK_DIR"
 }
 
 save_config_env() {
-  mkdir -p "$WORK_DIR"
-
   {
     write_env_line NODE_NAME "$NODE_NAME"
     write_env_line PROXY_TYPE "$PROXY_TYPE"
@@ -324,9 +311,10 @@ save_config_env() {
     write_env_line PROXY_PASS "$PROXY_PASS"
     write_env_line ARGO_DOMAIN "$ARGO_DOMAIN"
     write_env_line ARGO_AUTH "$ARGO_AUTH"
-    write_env_line CFPORT "$CFPORT"
+    write_env_line CLIENT_PORT "$CLIENT_PORT"
     write_env_line LOCAL_PORT "$LOCAL_PORT"
     write_env_line UUID "$UUID"
+    write_env_line WS_PATH "$WS_PATH"
   } > "$CONFIG_ENV"
 
   chmod 600 "$CONFIG_ENV"
@@ -348,8 +336,6 @@ stop_old_services() {
 
 download_core() {
   yellow "下载 sing-box 和 cloudflared..."
-
-  mkdir -p "$WORK_DIR"
 
   API_FILE="$WORK_DIR/sing-box-release.json"
   SB_TGZ="$WORK_DIR/sing-box.tgz"
@@ -449,7 +435,7 @@ make_singbox_config() {
       ],
       "transport": {
         "type": "ws",
-        "path": "/vmess-argo"
+        "path": "$WS_PATH"
       }
     }
   ],
@@ -576,7 +562,7 @@ EOF
 }
 
 make_natlink() {
-  yellow "创建 natlink 查看节点命令..."
+  yellow "创建 natlink 查看节点链接命令..."
 
   cat > /usr/local/bin/natlink <<'EOF'
 #!/usr/bin/env sh
@@ -584,7 +570,7 @@ set -eu
 
 . /etc/sing-box-nat/config.env
 
-JSON="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"/vmess-argo","tls":"tls","sni":"%s","alpn":"","fp":"chrome","allowInsecure":"false"}' "$NODE_NAME" "$ARGO_DOMAIN" "$UUID" "$ARGO_DOMAIN" "$ARGO_DOMAIN")"
+JSON="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":"chrome","allowInsecure":"false"}' "$NODE_NAME" "$ARGO_DOMAIN" "$UUID" "$ARGO_DOMAIN" "$WS_PATH" "$ARGO_DOMAIN")"
 
 LINK="vmess://$(printf "%s" "$JSON" | base64 | tr -d '\n')"
 
@@ -617,33 +603,33 @@ show_result() {
 
   echo >&2
   yellow "Cloudflare Tunnel 公共主机名必须这样配置："
-  echo "  公共主机名：$ARGO_DOMAIN" >&2
-  echo "  服务类型：HTTP" >&2
-  echo "  服务地址：http://127.0.0.1:$LOCAL_PORT" >&2
+  plain "  公共主机名：$ARGO_DOMAIN"
+  plain "  服务类型：HTTP"
+  plain "  服务地址：http://127.0.0.1:$LOCAL_PORT"
   echo >&2
 
   yellow "客户端连接信息："
-  echo "  地址：$ARGO_DOMAIN" >&2
-  echo "  端口：443" >&2
-  echo "  传输：WebSocket" >&2
-  echo "  路径：/vmess-argo" >&2
-  echo "  TLS：开启" >&2
+  plain "  地址：$ARGO_DOMAIN"
+  plain "  端口：443"
+  plain "  传输：WebSocket"
+  plain "  路径：$WS_PATH"
+  plain "  TLS：开启"
   echo >&2
 
   yellow "常用命令："
 
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    echo "  查看 sing-box：systemctl status sing-box-nat --no-pager" >&2
-    echo "  查看 Tunnel：systemctl status argo-nat --no-pager" >&2
-    echo "  重启服务：systemctl restart sing-box-nat argo-nat" >&2
+    plain "  查看 sing-box：systemctl status sing-box-nat --no-pager"
+    plain "  查看 Tunnel：systemctl status argo-nat --no-pager"
+    plain "  重启服务：systemctl restart sing-box-nat argo-nat"
   else
-    echo "  查看 sing-box：rc-service sing-box-nat status" >&2
-    echo "  查看 Tunnel：rc-service argo-nat status" >&2
-    echo "  重启 sing-box：rc-service sing-box-nat restart" >&2
-    echo "  重启 Tunnel：rc-service argo-nat restart" >&2
+    plain "  查看 sing-box：rc-service sing-box-nat status"
+    plain "  查看 Tunnel：rc-service argo-nat status"
+    plain "  重启 sing-box：rc-service sing-box-nat restart"
+    plain "  重启 Tunnel：rc-service argo-nat restart"
   fi
 
-  echo "  查看节点链接：natlink" >&2
+  plain "  查看节点链接：natlink"
   echo >&2
 
   yellow "链路结构：客户端 → Cloudflare Tunnel → NAT 小鸡 sing-box → 代理 IP → 目标网站"
@@ -654,7 +640,7 @@ main() {
   install_pkgs
   detect_service_manager
   detect_arch
-  load_old_config
+  prepare_dirs
   collect_config
   save_config_env
   stop_old_services
